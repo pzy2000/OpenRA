@@ -60,6 +60,13 @@ namespace OpenRA
 
 		static bool takeScreenshot = false;
 		static Benchmark benchmark = null;
+		static string warptestScreenshotPath = null;
+		static int warptestScreenshotFrame = 10;
+		static bool warptestExitAfterScreenshot = false;
+		static bool warptestScreenshotTaken = false;
+		static World warptestScreenshotWorld = null;
+		static int warptestScreenshotWorldRenderFrame = 0;
+		static bool WarptestScreenshotPending => !warptestScreenshotTaken && !string.IsNullOrEmpty(warptestScreenshotPath);
 
 		public static event Action OnShellmapLoaded = () => { };
 
@@ -698,6 +705,59 @@ namespace OpenRA
 			takeScreenshot = true;
 		}
 
+		public static void ConfigureWarptestScreenshot(string path, int frame, bool exitAfterScreenshot)
+		{
+			warptestScreenshotPath = string.IsNullOrEmpty(path) ? null : path;
+			warptestScreenshotFrame = Math.Max(1, frame);
+			warptestExitAfterScreenshot = exitAfterScreenshot;
+			warptestScreenshotTaken = false;
+			warptestScreenshotWorld = null;
+			warptestScreenshotWorldRenderFrame = 0;
+
+			if (!string.IsNullOrEmpty(warptestScreenshotPath))
+			{
+				Console.WriteLine("Configured WarpTest gameplay screenshot: " + warptestScreenshotPath);
+				Log.Write("debug", $"Configured WarpTest gameplay screenshot: path={warptestScreenshotPath}, " +
+					$"frame={warptestScreenshotFrame}, exit={warptestExitAfterScreenshot}");
+			}
+		}
+
+		static void MaybeTakeWarptestScreenshot()
+		{
+			if (warptestScreenshotTaken ||
+				string.IsNullOrEmpty(warptestScreenshotPath) ||
+				worldRenderer?.World == null)
+				return;
+
+			var world = worldRenderer.World;
+			if (!ReferenceEquals(warptestScreenshotWorld, world))
+			{
+				warptestScreenshotWorld = world;
+				warptestScreenshotWorldRenderFrame = 0;
+				Log.Write("debug", $"WarpTest gameplay screenshot waiting on world type={world.Type}, " +
+					$"target frame={warptestScreenshotFrame}");
+			}
+
+			if (world.Type != WorldType.Regular || world.IsLoadingGameSave)
+				return;
+
+			warptestScreenshotWorldRenderFrame++;
+			if (warptestScreenshotWorldRenderFrame < warptestScreenshotFrame)
+				return;
+
+			var directory = Path.GetDirectoryName(warptestScreenshotPath);
+			if (!string.IsNullOrEmpty(directory))
+				Directory.CreateDirectory(directory);
+
+			Log.Write("debug", "Taking WarpTest screenshot " + warptestScreenshotPath);
+			Console.WriteLine("Taking WarpTest screenshot " + warptestScreenshotPath);
+			Renderer.SaveScreenshotSync(warptestScreenshotPath);
+			warptestScreenshotTaken = true;
+
+			if (warptestExitAfterScreenshot)
+				Exit();
+		}
+
 		static void RenderTick()
 		{
 			using (new PerfSample("render"))
@@ -751,6 +811,8 @@ namespace OpenRA
 
 				using (new PerfSample("render_flip"))
 					Renderer.EndFrame(new DefaultInputHandler(OrderManager.World));
+
+				MaybeTakeWarptestScreenshot();
 
 				if (takeScreenshot)
 				{
@@ -862,7 +924,7 @@ namespace OpenRA
 
 					var haveSomeTimeUntilNextLogic = now < nextLogic;
 					var isTimeToRender = now >= nextRender;
-					if (!Renderer.WindowIsSuspended)
+					if (!Renderer.WindowIsSuspended || WarptestScreenshotPending)
 					{
 						if (isTimeToRender || forceRender)
 						{
@@ -1019,11 +1081,66 @@ namespace OpenRA
 				Order.Command($"state {Session.ClientState.Ready}")
 			};
 
-			var map = ModData.MapCache.SingleOrDefault(m => m.Uid == launchMap || Path.GetFileName(m.Path) == launchMap);
+			var map = ModData.MapCache.SingleOrDefault(m =>
+				m.Uid == launchMap || Path.GetFileName(m.Path) == launchMap);
 			if (map == null)
 				throw new ArgumentException($"Could not find map '{launchMap}'.");
 
 			CreateAndStartLocalServer(map.Uid, orders);
+		}
+
+		public static void LoadMapForWarptestScreenshot(string launchMap)
+		{
+			var preview = ModData.MapCache.SingleOrDefault(m =>
+				m.Uid == launchMap || Path.GetFileName(m.Path) == launchMap);
+			if (preview == null)
+				throw new ArgumentException($"Could not find map '{launchMap}'.");
+
+			var map = preview.ToMap();
+			var mapPlayers = new MapPlayers(map.PlayerDefinitions).Players;
+			var playablePlayers = mapPlayers.Values.Where(p => p.Playable).ToArray();
+			var localPlayerReference = playablePlayers.FirstOrDefault();
+
+			OrderManager.LobbyInfo.GlobalSettings.Map = map.Uid;
+			OrderManager.LobbyInfo.GlobalSettings.MapStatus = Session.MapStatus.Playable;
+			OrderManager.LobbyInfo.GlobalSettings.AllowSpectators = true;
+			OrderManager.LobbyInfo.GlobalSettings.EnableSingleplayer = true;
+			OrderManager.LobbyInfo.GlobalSettings.LobbyOptions["gamespeed"] = new Session.LobbyOptionState
+			{
+				Value = "default",
+				PreferredValue = "default",
+				IsLocked = true
+			};
+
+			OrderManager.LobbyInfo.Slots = playablePlayers.Select(p => new Session.Slot
+			{
+				PlayerReference = p.Name,
+				AllowBots = p.AllowBots,
+				LockFaction = p.LockFaction,
+				LockColor = p.LockColor,
+				LockTeam = p.LockTeam,
+				LockHandicap = p.LockHandicap,
+				LockSpawn = p.LockSpawn,
+				Required = p.Required
+			}).ToDictionary(s => s.PlayerReference, s => s);
+
+			var localClient = OrderManager.LobbyInfo.ClientWithIndex(OrderManager.Connection.LocalClientId);
+			if (localClient != null)
+			{
+				localClient.State = Session.ClientState.Ready;
+				localClient.IsAdmin = true;
+				if (localPlayerReference != null)
+				{
+					localClient.Slot = localPlayerReference.Name;
+					Server.Server.SyncClientToPlayerReference(localClient, localPlayerReference);
+				}
+			}
+
+			Log.Write("debug", $"WarpTest clean launch map={map.Uid}, playableSlots={playablePlayers.Length}, " +
+				$"localSlot={localClient?.Slot ?? "observer"}");
+			Console.WriteLine($"WarpTest clean launch map={map.Uid}, playableSlots={playablePlayers.Length}, " +
+				$"localSlot={localClient?.Slot ?? "observer"}");
+			StartGame(map, WorldType.Regular);
 		}
 
 		public static void FinishBenchmark()

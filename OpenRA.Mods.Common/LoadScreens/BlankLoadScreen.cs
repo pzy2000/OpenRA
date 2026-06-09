@@ -46,6 +46,10 @@ namespace OpenRA.Mods.Common.LoadScreens
 		public virtual void StartGame(Arguments args)
 		{
 			Launch = new LaunchArguments(args);
+			Game.ConfigureWarptestScreenshot(
+				Launch.WarptestScreenshotPath,
+				Launch.WarptestScreenshotFrame,
+				Launch.WarptestExitAfterScreenshot);
 			Ui.ResetAll();
 			Game.Settings.Save();
 
@@ -68,7 +72,10 @@ namespace OpenRA.Mods.Common.LoadScreens
 			// Start a map directly
 			if (!string.IsNullOrEmpty(Launch.Map))
 			{
-				Game.LoadMap(Launch.Map);
+				if (!string.IsNullOrEmpty(Launch.WarptestScreenshotPath))
+					Game.LoadMapForWarptestScreenshot(Launch.Map);
+				else
+					Game.LoadMap(Launch.Map);
 				return;
 			}
 

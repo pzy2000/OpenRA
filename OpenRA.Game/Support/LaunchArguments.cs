@@ -31,6 +31,15 @@ namespace OpenRA
 		[Desc("Automatically start playing the given map.")]
 		public string Map;
 
+		[Desc("Internal WarpTest harness: write a real gameplay screenshot to this path after Launch.Map has rendered.")]
+		public string WarptestScreenshotPath;
+
+		[Desc("Internal WarpTest harness: regular-map render frame to capture.")]
+		public int WarptestScreenshotFrame = 10;
+
+		[Desc("Internal WarpTest harness: exit after writing WarptestScreenshotPath.")]
+		public bool WarptestExitAfterScreenshot;
+
 		public LaunchArguments(Arguments args)
 		{
 			if (args == null)

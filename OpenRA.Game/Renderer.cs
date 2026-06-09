@@ -529,15 +529,27 @@ namespace OpenRA
 			var destWidth = screenSprite.Bounds.Width;
 			var destHeight = -screenSprite.Bounds.Height;
 
-			ThreadPool.QueueUserWorkItem(_ =>
-			{
-				// Extract the screen rect from the (larger) backing surface
-				var dest = new byte[4 * destWidth * destHeight];
-				for (var y = 0; y < destHeight; y++)
-					Array.Copy(src, 4 * y * srcWidth, dest, 4 * y * destWidth, 4 * destWidth);
+			ThreadPool.QueueUserWorkItem(_ => SaveScreenshotData(path, src, srcWidth, destWidth, destHeight));
+		}
 
-				new Png(dest, SpriteFrameType.Bgra32, destWidth, destHeight).Save(path);
-			});
+		public void SaveScreenshotSync(string path)
+		{
+			// Pull the data from the Texture directly to prevent the sheet from buffering it
+			var src = screenBuffer.Texture.GetData();
+			var srcWidth = screenSprite.Sheet.Size.Width;
+			var destWidth = screenSprite.Bounds.Width;
+			var destHeight = -screenSprite.Bounds.Height;
+			SaveScreenshotData(path, src, srcWidth, destWidth, destHeight);
+		}
+
+		static void SaveScreenshotData(string path, byte[] src, int srcWidth, int destWidth, int destHeight)
+		{
+			// Extract the screen rect from the (larger) backing surface
+			var dest = new byte[4 * destWidth * destHeight];
+			for (var y = 0; y < destHeight; y++)
+				Array.Copy(src, 4 * y * srcWidth, dest, 4 * y * destWidth, 4 * destWidth);
+
+			new Png(dest, SpriteFrameType.Bgra32, destWidth, destHeight).Save(path);
 		}
 
 		public void Dispose()
