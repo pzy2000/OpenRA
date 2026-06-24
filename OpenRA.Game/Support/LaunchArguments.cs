@@ -40,6 +40,12 @@ namespace OpenRA
 		[Desc("Internal WarpTest harness: exit after writing WarptestScreenshotPath.")]
 		public bool WarptestExitAfterScreenshot;
 
+		[Desc("Internal WarpTest harness: read a gameplay probe request from this JSON path after Launch.Map starts.")]
+		public string WarptestGameplayRequestPath;
+
+		[Desc("Internal WarpTest harness: write the gameplay probe report to this JSON path.")]
+		public string WarptestGameplayReportPath;
+
 		public LaunchArguments(Arguments args)
 		{
 			if (args == null)

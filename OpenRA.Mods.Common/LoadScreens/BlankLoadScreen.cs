@@ -14,6 +14,7 @@ using System.IO;
 using OpenRA.FileFormats;
 using OpenRA.FileSystem;
 using OpenRA.Mods.Common.FileSystem;
+using OpenRA.Mods.Common.Traits;
 using OpenRA.Mods.Common.Widgets.Logic;
 using OpenRA.Widgets;
 
@@ -50,6 +51,9 @@ namespace OpenRA.Mods.Common.LoadScreens
 				Launch.WarptestScreenshotPath,
 				Launch.WarptestScreenshotFrame,
 				Launch.WarptestExitAfterScreenshot);
+			WarptestGameplayProbe.Configure(
+				Launch.WarptestGameplayRequestPath,
+				Launch.WarptestGameplayReportPath);
 			Ui.ResetAll();
 			Game.Settings.Save();
 
