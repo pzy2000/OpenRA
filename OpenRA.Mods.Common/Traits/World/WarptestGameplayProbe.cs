@@ -123,7 +123,7 @@ namespace OpenRA.Mods.Common.Traits
 		{
 			foreach (var actor in world.Actors.Where(a => a.IsInWorld && !a.IsDead && a.Owner != null))
 			{
-				var key = (actor.Owner.InternalName, actor.Info.Name);
+				var key = (actor.Owner.InternalName.ToLowerInvariant(), actor.Info.Name.ToLowerInvariant());
 				if (!initialActorIds.TryGetValue(key, out var ids))
 					initialActorIds[key] = ids = [];
 
@@ -638,7 +638,7 @@ namespace OpenRA.Mods.Common.Traits
 			if (string.IsNullOrEmpty(player) || string.IsNullOrEmpty(actor))
 				return 0;
 
-			initialActorIds.TryGetValue((player, actor.ToLowerInvariant()), out var initial);
+			initialActorIds.TryGetValue((player.ToLowerInvariant(), actor.ToLowerInvariant()), out var initial);
 			initial ??= [];
 			return world.Actors.Count(a => a.IsInWorld && !a.IsDead && a.Owner != null
 				&& string.Equals(a.Owner.InternalName, player, StringComparison.OrdinalIgnoreCase)
