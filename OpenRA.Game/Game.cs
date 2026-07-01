@@ -66,6 +66,11 @@ namespace OpenRA
 		static bool warptestScreenshotTaken = false;
 		static World warptestScreenshotWorld = null;
 		static int warptestScreenshotWorldRenderFrame = 0;
+		static bool warptestGameplayProbeConfigured = false;
+		static bool warptestGameplayProbeComplete = false;
+		static int warptestGameplayProbeExitCode = 0;
+		static bool warptestGameplayProbeHasCenter = false;
+		static WPos warptestGameplayProbeCenter;
 		static bool WarptestScreenshotPending => !warptestScreenshotTaken && !string.IsNullOrEmpty(warptestScreenshotPath);
 
 		public static event Action OnShellmapLoaded = () => { };
@@ -722,11 +727,71 @@ namespace OpenRA
 			}
 		}
 
+		// WarpTest harness: the gameplay probe (OpenRA.Mods.Common) signals that it is
+		// driving deterministic actions so the screenshot is deferred until those
+		// actions complete instead of firing on an early clean-launch frame.
+		public static void NotifyWarptestGameplayProbeConfigured(bool configured)
+		{
+			warptestGameplayProbeConfigured = configured;
+			warptestGameplayProbeComplete = false;
+			warptestGameplayProbeHasCenter = false;
+		}
+
+		// WarpTest harness: called by the gameplay probe once every action/assertion is
+		// done. When a screenshot is configured we defer the capture (and process exit)
+		// until the post-action frame; otherwise we preserve the probe's immediate exit.
+		public static void CompleteWarptestGameplayProbe(int exitCode)
+		{
+			warptestGameplayProbeExitCode = exitCode;
+			warptestGameplayProbeComplete = true;
+
+			// Restart the settle countdown from the completed post-action state so
+			// warptestScreenshotFrame is interpreted as settle frames after completion.
+			warptestScreenshotWorldRenderFrame = 0;
+
+			if (string.IsNullOrEmpty(warptestScreenshotPath))
+				Environment.Exit(exitCode);
+		}
+
+		// WarpTest harness: the probe passes the base/build anchor (mod-specific trait
+		// lookups live in OpenRA.Mods.Common) so the capture frames the built state.
+		public static void SetWarptestGameplayProbeCenter(WPos center)
+		{
+			warptestGameplayProbeCenter = center;
+			warptestGameplayProbeHasCenter = true;
+		}
+
+		// WarpTest harness: keep the viewport centered on the constructed base once the
+		// gameplay probe has finished, so the deferred screenshot frames the built state.
+		// Runs before PrepareRenderables/Draw so the centered camera is what gets rendered.
+		static void MaybeCenterWarptestViewport()
+		{
+			if (!warptestGameplayProbeComplete || !warptestGameplayProbeHasCenter || warptestScreenshotTaken)
+				return;
+
+			if (worldRenderer?.World == null || worldRenderer.World.Type != WorldType.Regular)
+				return;
+
+			try
+			{
+				worldRenderer.Viewport.Center(warptestGameplayProbeCenter);
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"WarpTest screenshot viewport centering failed: {e.Message}");
+			}
+		}
+
 		static void MaybeTakeWarptestScreenshot()
 		{
 			if (warptestScreenshotTaken ||
 				string.IsNullOrEmpty(warptestScreenshotPath) ||
 				worldRenderer?.World == null)
+				return;
+
+			// A gameplay probe drives deterministic build actions; wait for it to finish
+			// so the screenshot photographs the post-action state, not the clean launch.
+			if (warptestGameplayProbeConfigured && !warptestGameplayProbeComplete)
 				return;
 
 			var world = worldRenderer.World;
@@ -754,6 +819,9 @@ namespace OpenRA
 			Renderer.SaveScreenshotSync(warptestScreenshotPath);
 			warptestScreenshotTaken = true;
 
+			if (warptestGameplayProbeConfigured)
+				Environment.Exit(warptestGameplayProbeExitCode);
+
 			if (warptestExitAfterScreenshot)
 				Exit();
 		}
@@ -773,6 +841,7 @@ namespace OpenRA
 					if (worldRenderer != null && !worldRenderer.World.IsLoadingGameSave)
 					{
 						worldRenderer.Viewport.Tick();
+						MaybeCenterWarptestViewport();
 						worldRenderer.PrepareRenderables();
 					}
 

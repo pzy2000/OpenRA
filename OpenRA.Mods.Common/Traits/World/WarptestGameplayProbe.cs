@@ -52,10 +52,16 @@ namespace OpenRA.Mods.Common.Traits
 		bool finished;
 		int actionIndex;
 
+		Player primaryPlayer;
+
 		public static void Configure(string request, string report)
 		{
 			requestPath = request;
 			reportPath = report;
+
+			// Tell the engine harness a deterministic probe is driving the world so any
+			// configured WarpTest screenshot is deferred until the probe's actions finish.
+			Game.NotifyWarptestGameplayProbeConfigured(!string.IsNullOrEmpty(request));
 		}
 
 		public void WorldLoaded(World w, WorldRenderer wr)
@@ -231,6 +237,8 @@ namespace OpenRA.Mods.Common.Traits
 				return;
 			}
 
+			primaryPlayer ??= action.Player;
+
 			if (action.Subject == null || action.Subject.IsDead)
 			{
 				Fail($"actions.{action.Index}.actor_id", $"Unknown or dead map actor: {action.ActorId}");
@@ -291,6 +299,8 @@ namespace OpenRA.Mods.Common.Traits
 				CompleteCurrentAction(false);
 				return;
 			}
+
+			primaryPlayer ??= action.Player;
 
 			if (action.ActorInfo == null)
 			{
@@ -582,7 +592,41 @@ namespace OpenRA.Mods.Common.Traits
 				Log.Write("debug", $"Failed to write WarpTest gameplay report: {e}");
 			}
 
-			Environment.Exit(success ? 0 : 1);
+			PrepareScreenshotView();
+
+			// Hand off to the engine: when a WarpTest screenshot is configured this defers
+			// the process exit until the post-action frame has been captured; otherwise the
+			// engine exits immediately with this code (preserving the previous behaviour).
+			Game.CompleteWarptestGameplayProbe(success ? 0 : 1);
+		}
+
+		void PrepareScreenshotView()
+		{
+			try
+			{
+				// Reveal the map for the render player's camera. Production tasks may act on a
+				// player other than the rendered one (e.g. building the enemy's units from the
+				// human's perspective), whose base would otherwise sit under fog and capture an
+				// all-black frame. This is a harness-only capture (dev cheats already enabled).
+				if (world.RenderPlayer != null)
+					world.RenderPlayer.Shroud.Disabled = true;
+
+				// Center on the most recently created building owned by the acting player so the
+				// frame focuses on the constructed base and the newly produced units beside it.
+				if (primaryPlayer != null)
+				{
+					var building = world.Actors
+						.Where(a => a.IsInWorld && !a.IsDead && a.Owner == primaryPlayer && a.Info.HasTraitInfo<BuildingInfo>())
+						.OrderByDescending(a => a.ActorID)
+						.FirstOrDefault();
+					if (building != null)
+						Game.SetWarptestGameplayProbeCenter(building.CenterPosition);
+				}
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"WarpTest gameplay probe could not prepare the screenshot view: {e.Message}");
+			}
 		}
 
 		void Fail(string name, string detail, object expected = null, object actual = null)

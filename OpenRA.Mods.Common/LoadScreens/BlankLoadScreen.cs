@@ -76,7 +76,13 @@ namespace OpenRA.Mods.Common.LoadScreens
 			// Start a map directly
 			if (!string.IsNullOrEmpty(Launch.Map))
 			{
-				if (!string.IsNullOrEmpty(Launch.WarptestScreenshotPath))
+				// A gameplay probe run drives deterministic actions through the local
+				// server (Game.LoadMap); the screenshot is captured post-action by the
+				// deferred WarpTest capture. Only the clean cold-launch capture (no probe)
+				// uses the lobby-slot fast path.
+				if (!string.IsNullOrEmpty(Launch.WarptestGameplayRequestPath))
+					Game.LoadMap(Launch.Map);
+				else if (!string.IsNullOrEmpty(Launch.WarptestScreenshotPath))
 					Game.LoadMapForWarptestScreenshot(Launch.Map);
 				else
 					Game.LoadMap(Launch.Map);
