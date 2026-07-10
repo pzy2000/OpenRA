@@ -46,6 +46,18 @@ namespace OpenRA
 		[Desc("Internal WarpTest harness: write the gameplay probe report to this JSON path.")]
 		public string WarptestGameplayReportPath;
 
+		[Desc("Internal WarpTest C3 harness: read sequenced fuzz requests from this JSON path without restarting the engine process.")]
+		public string WarptestFuzzRequestPath;
+
+		[Desc("Internal WarpTest C3 harness: write sequenced fuzz reports to this JSON path.")]
+		public string WarptestFuzzReportPath;
+
+		[Desc("Internal WarpTest C3 harness: write reset-ready notifications to this JSON path.")]
+		public string WarptestFuzzReadyPath;
+
+		[Desc("Internal WarpTest C3 harness: optionally save a post-candidate screenshot for each sequenced fuzz request.")]
+		public string WarptestFuzzScreenshotDir;
+
 		public LaunchArguments(Arguments args)
 		{
 			if (args == null)

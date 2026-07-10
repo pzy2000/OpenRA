@@ -54,6 +54,12 @@ namespace OpenRA.Mods.Common.LoadScreens
 			WarptestGameplayProbe.Configure(
 				Launch.WarptestGameplayRequestPath,
 				Launch.WarptestGameplayReportPath);
+			WarptestGameplayProbe.ConfigureFuzzSession(
+				Launch.WarptestFuzzRequestPath,
+				Launch.WarptestFuzzReportPath,
+				Launch.WarptestFuzzReadyPath,
+				Launch.Map,
+				Launch.WarptestFuzzScreenshotDir);
 			Ui.ResetAll();
 			Game.Settings.Save();
 
@@ -80,7 +86,8 @@ namespace OpenRA.Mods.Common.LoadScreens
 				// server (Game.LoadMap); the screenshot is captured post-action by the
 				// deferred WarpTest capture. Only the clean cold-launch capture (no probe)
 				// uses the lobby-slot fast path.
-				if (!string.IsNullOrEmpty(Launch.WarptestGameplayRequestPath))
+				if (!string.IsNullOrEmpty(Launch.WarptestGameplayRequestPath) ||
+					!string.IsNullOrEmpty(Launch.WarptestFuzzRequestPath))
 					Game.LoadMap(Launch.Map);
 				else if (!string.IsNullOrEmpty(Launch.WarptestScreenshotPath))
 					Game.LoadMapForWarptestScreenshot(Launch.Map);

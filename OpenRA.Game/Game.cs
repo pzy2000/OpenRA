@@ -71,6 +71,8 @@ namespace OpenRA
 		static int warptestGameplayProbeExitCode = 0;
 		static bool warptestGameplayProbeHasCenter = false;
 		static WPos warptestGameplayProbeCenter;
+		static string warptestFuzzScreenshotPath = null;
+		static Action<string> warptestFuzzScreenshotCallback = null;
 		static bool WarptestScreenshotPending => !warptestScreenshotTaken && !string.IsNullOrEmpty(warptestScreenshotPath);
 
 		public static event Action OnShellmapLoaded = () => { };
@@ -274,12 +276,25 @@ namespace OpenRA
 
 		public static void RestartGame()
 		{
+			RestartGame(reseedRandomSeed: true);
+		}
+
+		// WarpTest C3 sessions reload a clean map between candidates. Preserve the
+		// lobby seed so the reset is a reproducible baseline rather than a new random game.
+		public static void RestartGamePreservingSeed()
+		{
+			RestartGame(reseedRandomSeed: false);
+		}
+
+		static void RestartGame(bool reseedRandomSeed)
+		{
 			var replay = OrderManager.Connection as ReplayConnection;
 			var replayName = replay?.Filename;
 			var lobbyInfo = OrderManager.LobbyInfo;
 
 			// Reseed the RNG so this isn't an exact repeat of the last game
-			lobbyInfo.GlobalSettings.RandomSeed = CosmeticRandom.Next();
+			if (reseedRandomSeed)
+				lobbyInfo.GlobalSettings.RandomSeed = CosmeticRandom.Next();
 
 			// Note: the map may have been changed on disk outside the game, changing its UID.
 			// Use the updated UID if we have tracked the update instead of failing.
@@ -617,6 +632,20 @@ namespace OpenRA
 		public static void RunAfterTick(Action a) { delayedActions.Add(a, RunTime); }
 		public static void RunAfterDelay(int delayMilliseconds, Action a) { delayedActions.Add(a, RunTime + delayMilliseconds); }
 
+		// WarpTest C3 sessions capture the rendered post-candidate state before reloading
+		// their deterministic baseline. Only one candidate can be active at a time.
+		public static void RequestWarptestFuzzScreenshot(string path, Action<string> callback)
+		{
+			if (string.IsNullOrEmpty(path) || warptestFuzzScreenshotCallback != null)
+			{
+				callback?.Invoke(null);
+				return;
+			}
+
+			warptestFuzzScreenshotPath = path;
+			warptestFuzzScreenshotCallback = callback;
+		}
+
 		static void TakeScreenshotInner()
 		{
 			using (new PerfTimer("Renderer.SaveScreenshot"))
@@ -826,6 +855,33 @@ namespace OpenRA
 				Exit();
 		}
 
+		static void MaybeTakeWarptestFuzzScreenshot()
+		{
+			if (string.IsNullOrEmpty(warptestFuzzScreenshotPath))
+				return;
+
+			var path = warptestFuzzScreenshotPath;
+			var callback = warptestFuzzScreenshotCallback;
+			warptestFuzzScreenshotPath = null;
+			warptestFuzzScreenshotCallback = null;
+
+			try
+			{
+				var directory = Path.GetDirectoryName(path);
+				if (!string.IsNullOrEmpty(directory))
+					Directory.CreateDirectory(directory);
+
+				Log.Write("debug", "Taking WarpTest C3 fuzz screenshot " + path);
+				Renderer.SaveScreenshotSync(path);
+				callback?.Invoke(File.Exists(path) ? path : null);
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", "Failed to take WarpTest C3 fuzz screenshot: " + e);
+				callback?.Invoke(null);
+			}
+		}
+
 		static void RenderTick()
 		{
 			using (new PerfSample("render"))
@@ -882,6 +938,7 @@ namespace OpenRA
 					Renderer.EndFrame(new DefaultInputHandler(OrderManager.World));
 
 				MaybeTakeWarptestScreenshot();
+				MaybeTakeWarptestFuzzScreenshot();
 
 				if (takeScreenshot)
 				{

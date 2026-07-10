@@ -15,6 +15,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using OpenRA.Graphics;
 using OpenRA.Traits;
 
@@ -34,6 +35,8 @@ namespace OpenRA.Mods.Common.Traits
 
 		static string requestPath;
 		static string reportPath;
+		static readonly Regex SafeIdRegex = new("^[A-Za-z0-9_.-]+$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+		static FuzzSession fuzzSession;
 
 		readonly List<ProbeCheck> checks = [];
 		readonly List<string> errors = [];
@@ -46,10 +49,14 @@ namespace OpenRA.Mods.Common.Traits
 		JsonArray actions;
 		JsonArray assertions;
 		JsonObject setup;
+		JsonObject fuzzState;
 		ProbeAction current;
 		bool active;
 		bool setupApplied;
 		bool finished;
+		bool fuzzReadyPending;
+		bool fuzzCandidateActive;
+		long fuzzSequence;
 		int actionIndex;
 
 		Player primaryPlayer;
@@ -64,8 +71,25 @@ namespace OpenRA.Mods.Common.Traits
 			Game.NotifyWarptestGameplayProbeConfigured(!string.IsNullOrEmpty(request));
 		}
 
+		public static void ConfigureFuzzSession(string request, string report, string ready, string map, string screenshotDirectory)
+		{
+			if (string.IsNullOrEmpty(request) || string.IsNullOrEmpty(report) || string.IsNullOrEmpty(ready))
+			{
+				fuzzSession = null;
+				return;
+			}
+
+			fuzzSession = new FuzzSession(request, report, ready, map, screenshotDirectory);
+		}
+
 		public void WorldLoaded(World w, WorldRenderer wr)
 		{
+			if (fuzzSession != null)
+			{
+				InitializeFuzzSessionWorld(w);
+				return;
+			}
+
 			if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath))
 				return;
 
@@ -94,6 +118,12 @@ namespace OpenRA.Mods.Common.Traits
 
 		void ITick.Tick(Actor self)
 		{
+			if (fuzzSession != null)
+			{
+				TickFuzzSession();
+				return;
+			}
+
 			if (!active || finished)
 				return;
 
@@ -123,6 +153,308 @@ namespace OpenRA.Mods.Common.Traits
 				Fail("probe.exception", e.ToString());
 				Finish(false, "OpenRA gameplay probe failed with an exception.");
 			}
+		}
+
+		void InitializeFuzzSessionWorld(World w)
+		{
+			active = true;
+			world = w;
+			spawnMapActors = world.WorldActor.TraitOrDefault<SpawnMapActors>();
+			fuzzReadyPending = true;
+			CaptureInitialActors();
+		}
+
+		void TickFuzzSession()
+		{
+			if (!active || finished)
+				return;
+
+			try
+			{
+				// Publish readiness from the first world tick, rather than WorldLoaded, so the
+				// external harness only observes a world that has started accepting orders.
+				if (fuzzReadyPending)
+				{
+					fuzzReadyPending = false;
+					WriteFuzzReady();
+					return;
+				}
+
+				if (!fuzzCandidateActive)
+				{
+					TryStartFuzzCandidate();
+					return;
+				}
+
+				if (!setupApplied)
+				{
+					ApplyFuzzState();
+					setupApplied = true;
+				}
+
+				if (current == null && actionIndex < actions.Count)
+					StartAction(actions[actionIndex] as JsonObject);
+
+				if (current != null)
+					TickAction();
+
+				if (current == null && actionIndex >= actions.Count)
+				{
+					var success = checks.All(c => c.Status == "success") && errors.Count == 0;
+					CompleteFuzzCandidate(
+						success ? "success" : "robust",
+						success ? "completed" : ClassifyRobustFailure(),
+						success ? "OpenRA C3 fuzz candidate completed." : errors.FirstOrDefault() ?? "OpenRA C3 fuzz candidate was rejected by gameplay preconditions.");
+				}
+			}
+			catch (Exception e)
+			{
+				CompleteFuzzCandidate("engine_error", "exception", e.ToString());
+			}
+		}
+
+		void TryStartFuzzCandidate()
+		{
+			if (!File.Exists(fuzzSession.RequestPath))
+				return;
+
+			string requestText;
+			string requestFingerprint;
+			try
+			{
+				var requestInfo = new FileInfo(fuzzSession.RequestPath);
+				if (requestInfo.Length > FuzzSession.MaxRequestBytes)
+				{
+					RejectFuzzRequest(fuzzSession.LastCompletedSequence + 1,
+						$"C3 fuzz request exceeds the {FuzzSession.MaxRequestBytes} byte protocol limit.",
+						requestInfo.Length + ":" + requestInfo.LastWriteTimeUtc.Ticks);
+					return;
+				}
+
+				requestText = File.ReadAllText(fuzzSession.RequestPath);
+				requestFingerprint = requestInfo.Length + ":" + requestInfo.LastWriteTimeUtc.Ticks;
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"Unable to read WarpTest C3 fuzz request: {e.Message}");
+				return;
+			}
+
+			JsonObject root;
+			try
+			{
+				root = JsonNode.Parse(requestText) as JsonObject;
+				if (root == null)
+					throw new InvalidDataException("Request JSON must be an object.");
+			}
+			catch (Exception e)
+			{
+				RejectFuzzRequest(fuzzSession.LastCompletedSequence + 1,
+					"Unable to parse C3 fuzz request JSON: " + e.Message, requestFingerprint);
+				return;
+			}
+
+			if (!TryValidateFuzzRequest(root, out var request, out var sequence, out var detail))
+			{
+				if (sequence <= fuzzSession.LastCompletedSequence)
+					return;
+
+				RejectFuzzRequest(sequence > 0 ? sequence : fuzzSession.LastCompletedSequence + 1, detail, requestFingerprint);
+				return;
+			}
+
+			if (request.Sequence <= fuzzSession.LastCompletedSequence)
+				return;
+
+			fuzzSequence = request.Sequence;
+			fuzzState = request.FuzzState;
+			actions = fuzzState["actions"] as JsonArray ?? [];
+			assertions = [];
+			setup = null;
+			current = null;
+			actionIndex = 0;
+			setupApplied = false;
+			fuzzCandidateActive = true;
+			checks.Add(ProbeCheck.Success("session.sequence", $"Accepted C3 fuzz request sequence {fuzzSequence}."));
+		}
+
+		void RejectFuzzRequest(long sequence, string detail, string fingerprint)
+		{
+			if (string.Equals(fuzzSession.LastRejectedRequestFingerprint, fingerprint, StringComparison.Ordinal))
+				return;
+
+			fuzzSession.LastRejectedRequestFingerprint = fingerprint;
+			fuzzSequence = sequence;
+			actions = [];
+			assertions = [];
+			Fail("session.protocol", detail);
+			CompleteFuzzCandidate("rejected", "protocol", detail);
+		}
+
+		void ApplyFuzzState()
+		{
+			var players = fuzzState?["players"] as JsonArray ?? [];
+			for (var i = 0; i < players.Count; i++)
+			{
+				var state = players[i] as JsonObject;
+				var id = ReadString(state, "id");
+				var player = FindPlayer(id);
+				if (player == null)
+				{
+					Fail($"players.{i}.id", $"Unknown player: {id}");
+					continue;
+				}
+
+				primaryPlayer ??= player;
+				var resources = player.PlayerActor.TraitOrDefault<PlayerResources>();
+				if (TryReadInt(state, "cash", out var cash))
+				{
+					if (resources == null)
+						Fail($"players.{i}.cash", $"Player {id} does not expose PlayerResources.");
+					else
+						resources.ChangeCash(cash - resources.GetCashAndResources());
+				}
+
+				var developerMode = player.PlayerActor.TraitOrDefault<DeveloperMode>();
+				if (TryReadBool(state, "fast_build", out var fastBuild))
+					SetFuzzDeveloperFlag(i, id, player, developerMode, fastBuild,
+						developerMode?.FastBuild ?? false, DeveloperMode.Orders.FastBuild, "fast_build");
+				if (TryReadBool(state, "build_anywhere", out var buildAnywhere))
+					SetFuzzDeveloperFlag(i, id, player, developerMode, buildAnywhere,
+						developerMode?.BuildAnywhere ?? false, DeveloperMode.Orders.BuildAnywhere, "build_anywhere");
+			}
+		}
+
+		void SetFuzzDeveloperFlag(int playerIndex, string playerId, Player player, DeveloperMode developerMode,
+			bool requested, bool currentValue, string order, string field)
+		{
+			if (developerMode == null)
+			{
+				Fail($"players.{playerIndex}.{field}", $"Player {playerId} does not expose DeveloperMode.");
+				return;
+			}
+
+			if (requested == currentValue)
+				return;
+
+			player.PlayerActor.ResolveOrder(new Order(order, player.PlayerActor, false));
+			var appliedValue = order == DeveloperMode.Orders.FastBuild
+				? developerMode.FastBuild
+				: developerMode.BuildAnywhere;
+			if (requested != appliedValue)
+				Fail($"players.{playerIndex}.{field}", $"Player {playerId} did not apply requested {field} state.");
+		}
+
+		void CompleteFuzzCandidate(string status, string category, string detail)
+		{
+			if (finished)
+				return;
+
+			finished = true;
+			active = false;
+			fuzzCandidateActive = false;
+			PrepareScreenshotView();
+
+			if (!string.IsNullOrEmpty(fuzzSession.ScreenshotDirectory))
+			{
+				try
+				{
+					var screenshotPath = Path.Combine(fuzzSession.ScreenshotDirectory, $"candidate-{fuzzSequence}.png");
+					Game.RequestWarptestFuzzScreenshot(screenshotPath,
+						capturedPath => FinalizeFuzzCandidate(status, category, detail, capturedPath));
+					return;
+				}
+				catch (Exception e)
+				{
+					Log.Write("debug", $"Failed to schedule WarpTest C3 fuzz screenshot: {e}");
+				}
+			}
+
+			FinalizeFuzzCandidate(status, category, detail, null);
+		}
+
+		void FinalizeFuzzCandidate(string status, string category, string detail, string screenshotPath)
+		{
+			var report = new JsonObject
+			{
+				["version"] = FuzzSession.ProtocolVersion,
+				["sequence"] = fuzzSequence,
+				["status"] = status,
+				["category"] = category,
+				["detail"] = detail,
+				["checks"] = new JsonArray(checks.Select(c => c.ToJson()).ToArray()),
+				["errors"] = new JsonArray(errors.Select(e => JsonValue.Create(e)).ToArray()),
+				["summary"] = new JsonObject
+				{
+					["actionsExecuted"] = Math.Min(actionIndex, actions?.Count ?? 0),
+					["actionsTotal"] = actions?.Count ?? 0,
+					["worldTick"] = world?.WorldTick ?? 0,
+				}
+			};
+
+			if (!string.IsNullOrEmpty(screenshotPath))
+				report["screenshot_path"] = screenshotPath;
+
+			try
+			{
+				WriteJsonAtomically(fuzzSession.ReportPath, report);
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"Failed to write WarpTest C3 fuzz report: {e}");
+			}
+
+			fuzzSession.LastCompletedSequence = fuzzSequence;
+			Game.RunAfterTick(RestartFuzzSessionMap);
+		}
+
+		void RestartFuzzSessionMap()
+		{
+			try
+			{
+				Game.RestartGamePreservingSeed();
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"Failed to reset WarpTest C3 fuzz session: {e}");
+			}
+		}
+
+		static void WriteFuzzReady()
+		{
+			var ready = new JsonObject
+			{
+				["version"] = FuzzSession.ProtocolVersion,
+				["status"] = "ready",
+				["sequence"] = fuzzSession.LastCompletedSequence,
+			};
+
+			if (!string.IsNullOrEmpty(fuzzSession.Map))
+				ready["map"] = fuzzSession.Map;
+
+			try
+			{
+				WriteJsonAtomically(fuzzSession.ReadyPath, ready);
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"Failed to write WarpTest C3 fuzz ready signal: {e}");
+			}
+		}
+
+		string ClassifyRobustFailure()
+		{
+			var detail = errors.FirstOrDefault() ?? "";
+			if (detail.Contains("Unknown player", StringComparison.OrdinalIgnoreCase))
+				return "unknown_player";
+			if (detail.Contains("Unknown actor", StringComparison.OrdinalIgnoreCase) || detail.Contains("Unknown or dead map actor", StringComparison.OrdinalIgnoreCase))
+				return "unknown_actor";
+			if (detail.Contains("prerequisite", StringComparison.OrdinalIgnoreCase))
+				return "prerequisite_rejected";
+			if (detail.Contains("queue", StringComparison.OrdinalIgnoreCase))
+				return "queue_rejected";
+
+			return "action_rejected";
 		}
 
 		void CaptureInitialActors()
@@ -711,6 +1043,385 @@ namespace OpenRA.Mods.Common.Traits
 			return value.GetValue<bool>();
 		}
 
+		static bool TryValidateFuzzRequest(JsonObject root, out FuzzRequest request, out long sequence, out string detail)
+		{
+			request = null;
+
+			if (!TryReadLong(root, "sequence", out sequence) || sequence < 1)
+			{
+				detail = "C3 fuzz request sequence must be a positive integer.";
+				return false;
+			}
+
+			if (!HasOnlyProperties(root, "version", "sequence", "fuzz_state"))
+			{
+				detail = "C3 fuzz request contains fields outside the session protocol.";
+				return false;
+			}
+
+			if (!TryReadString(root, "version", out var version) || !string.Equals(version, FuzzSession.ProtocolVersion, StringComparison.Ordinal))
+			{
+				detail = $"C3 fuzz request version must be {FuzzSession.ProtocolVersion}.";
+				return false;
+			}
+
+			if (!root.TryGetPropertyValue("fuzz_state", out var stateNode) || stateNode is not JsonObject state)
+			{
+				detail = "C3 fuzz request fuzz_state must be an object.";
+				return false;
+			}
+
+			if (!ValidateFuzzState(state, out detail))
+				return false;
+
+			request = new FuzzRequest(sequence, state);
+			return true;
+		}
+
+		static bool ValidateFuzzState(JsonObject state, out string detail)
+		{
+			detail = null;
+			if (!HasOnlyProperties(state, "players", "actions"))
+			{
+				detail = "fuzz_state contains fields outside the supported players/actions whitelist.";
+				return false;
+			}
+
+			if (!state.ContainsKey("players") || !state.ContainsKey("actions"))
+			{
+				detail = "fuzz_state must contain both players and actions arrays.";
+				return false;
+			}
+
+			if (state.TryGetPropertyValue("players", out var playerNodes))
+			{
+				if (playerNodes is not JsonArray players)
+				{
+					detail = "fuzz_state.players must be an array.";
+					return false;
+				}
+
+				if (players.Count > FuzzSession.MaxPlayers)
+				{
+					detail = $"fuzz_state.players may contain at most {FuzzSession.MaxPlayers} entries.";
+					return false;
+				}
+
+				var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				for (var i = 0; i < players.Count; i++)
+					if (!ValidateFuzzPlayer(players[i] as JsonObject, i, ids, out detail))
+						return false;
+			}
+
+			if (state.TryGetPropertyValue("actions", out var actionNodes))
+			{
+				if (actionNodes is not JsonArray fuzzActions)
+				{
+					detail = "fuzz_state.actions must be an array.";
+					return false;
+				}
+
+				if (fuzzActions.Count > FuzzSession.MaxActions)
+				{
+					detail = $"fuzz_state.actions may contain at most {FuzzSession.MaxActions} entries.";
+					return false;
+				}
+
+				for (var i = 0; i < fuzzActions.Count; i++)
+					if (!ValidateFuzzAction(fuzzActions[i] as JsonObject, i, out detail))
+						return false;
+			}
+
+			return true;
+		}
+
+		static bool ValidateFuzzPlayer(JsonObject player, int index, HashSet<string> ids, out string detail)
+		{
+			if (player == null || !HasOnlyProperties(player, "id", "cash", "fast_build", "build_anywhere"))
+			{
+				detail = $"fuzz_state.players[{index}] must be an object limited to id, cash, fast_build, and build_anywhere.";
+				return false;
+			}
+
+			if (!TryReadString(player, "id", out var id) || !IsSafeId(id))
+			{
+				detail = $"fuzz_state.players[{index}].id must be a safe id with at most {FuzzSession.MaxIdLength} characters.";
+				return false;
+			}
+
+			if (!ids.Add(id))
+			{
+				detail = $"fuzz_state.players[{index}].id duplicates a previous player id.";
+				return false;
+			}
+
+			if (!player.ContainsKey("cash") || !player.ContainsKey("fast_build") || !player.ContainsKey("build_anywhere"))
+			{
+				detail = $"fuzz_state.players[{index}] must include cash, fast_build, and build_anywhere.";
+				return false;
+			}
+
+			if (!ValidateRequiredInt(player, "cash", 0, FuzzSession.MaxCash, out detail) ||
+				!ValidateRequiredBool(player, "fast_build", out detail) ||
+				!ValidateRequiredBool(player, "build_anywhere", out detail))
+			{
+				detail = $"fuzz_state.players[{index}]: {detail}";
+				return false;
+			}
+
+			detail = null;
+			return true;
+		}
+
+		static bool ValidateFuzzAction(JsonObject action, int index, out string detail)
+		{
+			detail = null;
+			if (action == null || !TryReadString(action, "type", out var type))
+			{
+				detail = $"fuzz_state.actions[{index}].type must name an existing OpenRA gameplay action.";
+				return false;
+			}
+
+			switch (type)
+			{
+				case "openra_wait_ticks":
+					if (!HasOnlyProperties(action, "type", "ticks") || !ValidateRequiredInt(action, "ticks", 0, FuzzSession.MaxTicks, out detail))
+					{
+						detail = $"fuzz_state.actions[{index}]: {detail ?? "openra_wait_ticks only accepts a bounded ticks field."}";
+						return false;
+					}
+
+					return true;
+
+				case "openra_deploy_actor":
+					if (!HasOnlyProperties(action, "type", "player", "actor_id", "wait_until_actor", "timeout_ticks") ||
+						!ValidateRequiredSafeId(action, "player", out detail) ||
+						!ValidateRequiredSafeId(action, "actor_id", out detail) ||
+						!ValidateOptionalSafeId(action, "wait_until_actor", out detail) ||
+						!ValidateOptionalInt(action, "timeout_ticks", 0, FuzzSession.MaxTicks, out detail))
+					{
+						detail = $"fuzz_state.actions[{index}]: {detail ?? "invalid openra_deploy_actor fields."}";
+						return false;
+					}
+
+					return true;
+
+				case "openra_build_actor":
+					if (!HasOnlyProperties(action, "type", "player", "actor", "queue", "timeout_ticks", "place_at", "place_near", "post_complete_grace_ticks") ||
+						!ValidateRequiredSafeId(action, "player", out detail) ||
+						!ValidateRequiredSafeId(action, "actor", out detail) ||
+						!ValidateOptionalSafeId(action, "queue", out detail) ||
+						!ValidateOptionalInt(action, "timeout_ticks", 0, FuzzSession.MaxTicks, out detail) ||
+						!ValidateOptionalInt(action, "post_complete_grace_ticks", 0, FuzzSession.MaxTicks, out detail) ||
+						!ValidateOptionalCell(action, "place_at", out detail) ||
+						!ValidateOptionalPlaceNear(action, out detail))
+					{
+						detail = $"fuzz_state.actions[{index}]: {detail ?? "invalid openra_build_actor fields."}";
+						return false;
+					}
+
+					return true;
+
+				default:
+					detail = $"fuzz_state.actions[{index}].type {type} is not an exposed OpenRA gameplay action.";
+					return false;
+			}
+		}
+
+		static bool ValidateRequiredSafeId(JsonObject node, string key, out string detail)
+		{
+			detail = null;
+			if (TryReadString(node, key, out var value) && IsSafeId(value))
+				return true;
+
+			detail = $"{key} must be a safe id with at most {FuzzSession.MaxIdLength} characters.";
+			return false;
+		}
+
+		static bool ValidateOptionalSafeId(JsonObject node, string key, out string detail)
+		{
+			detail = null;
+			if (!node.TryGetPropertyValue(key, out _))
+				return true;
+
+			if (TryReadString(node, key, out var text) && IsSafeId(text))
+				return true;
+
+			detail = $"{key} must be a safe id with at most {FuzzSession.MaxIdLength} characters.";
+			return false;
+		}
+
+		static bool ValidateRequiredInt(JsonObject node, string key, int minimum, int maximum, out string detail)
+		{
+			detail = null;
+			if (TryReadInt(node, key, out var value) && value >= minimum && value <= maximum)
+				return true;
+
+			detail = $"{key} must be an integer from {minimum} to {maximum}.";
+			return false;
+		}
+
+		static bool ValidateOptionalInt(JsonObject node, string key, int minimum, int maximum, out string detail)
+		{
+			detail = null;
+			if (!node.TryGetPropertyValue(key, out _))
+				return true;
+
+			if (TryReadInt(node, key, out var number) && number >= minimum && number <= maximum)
+				return true;
+
+			detail = $"{key} must be an integer from {minimum} to {maximum}.";
+			return false;
+		}
+
+		static bool ValidateRequiredBool(JsonObject node, string key, out string detail)
+		{
+			detail = null;
+			if (TryReadBool(node, key, out _))
+				return true;
+
+			detail = $"{key} must be a boolean.";
+			return false;
+		}
+
+		static bool ValidateOptionalCell(JsonObject node, string key, out string detail)
+		{
+			detail = null;
+			if (!node.TryGetPropertyValue(key, out _))
+				return true;
+
+			if (TryReadString(node, key, out var cell) && cell.Length <= FuzzSession.MaxIdLength && TryParseCell(cell, out _))
+				return true;
+
+			detail = $"{key} must be a coordinate in x,y form.";
+			return false;
+		}
+
+		static bool ValidateOptionalPlaceNear(JsonObject action, out string detail)
+		{
+			detail = null;
+			if (!action.TryGetPropertyValue("place_near", out var value))
+				return true;
+
+			if (value is not JsonObject placeNear || !HasOnlyProperties(placeNear, "anchor", "radius"))
+			{
+				detail = "place_near must be an object limited to anchor and radius.";
+				return false;
+			}
+
+			if (!ValidateOptionalCell(placeNear, "anchor", out detail) || !placeNear.ContainsKey("anchor"))
+			{
+				detail ??= "place_near.anchor must be a coordinate in x,y form.";
+				return false;
+			}
+
+			return ValidateOptionalInt(placeNear, "radius", 0, FuzzSession.MaxPlacementRadius, out detail);
+		}
+
+		static bool HasOnlyProperties(JsonObject node, params string[] allowed)
+		{
+			foreach (var property in node)
+				if (!allowed.Any(a => string.Equals(a, property.Key, StringComparison.Ordinal)))
+					return false;
+
+			return true;
+		}
+
+		static bool IsSafeId(string value)
+		{
+			return !string.IsNullOrEmpty(value) &&
+				value.Length <= FuzzSession.MaxIdLength &&
+				SafeIdRegex.IsMatch(value) &&
+				!value.Contains("..", StringComparison.Ordinal);
+		}
+
+		static bool TryReadString(JsonObject obj, string key, out string value)
+		{
+			value = null;
+			if (obj == null || !obj.TryGetPropertyValue(key, out var node) || node == null)
+				return false;
+
+			try
+			{
+				value = node.GetValue<string>();
+				return value != null;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
+
+		static bool TryReadInt(JsonObject obj, string key, out int value)
+		{
+			value = 0;
+			if (obj == null || !obj.TryGetPropertyValue(key, out var node) || node == null)
+				return false;
+
+			try
+			{
+				value = node.GetValue<int>();
+				return true;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
+
+		static bool TryReadLong(JsonObject obj, string key, out long value)
+		{
+			value = 0;
+			if (obj == null || !obj.TryGetPropertyValue(key, out var node) || node == null)
+				return false;
+
+			try
+			{
+				value = node.GetValue<long>();
+				return true;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
+
+		static bool TryReadBool(JsonObject obj, string key, out bool value)
+		{
+			value = false;
+			if (obj == null || !obj.TryGetPropertyValue(key, out var node) || node == null)
+				return false;
+
+			try
+			{
+				value = node.GetValue<bool>();
+				return true;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
+
+		static void WriteJsonAtomically(string path, JsonObject data)
+		{
+			var directory = Path.GetDirectoryName(path);
+			if (!string.IsNullOrEmpty(directory))
+				Directory.CreateDirectory(directory);
+
+			var temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+			try
+			{
+				File.WriteAllText(temporaryPath, data.ToJsonString(JsonOptions));
+				File.Move(temporaryPath, path, true);
+			}
+			finally
+			{
+				if (File.Exists(temporaryPath))
+					File.Delete(temporaryPath);
+			}
+		}
+
 		static bool TryParseCell(string value, out CPos cell)
 		{
 			cell = CPos.Zero;
@@ -724,6 +1435,37 @@ namespace OpenRA.Mods.Common.Traits
 			cell = new CPos(x, y);
 			return true;
 		}
+
+		sealed class FuzzSession
+		{
+			public const string ProtocolVersion = "c3-session-v1";
+			public const int MaxRequestBytes = 64 * 1024;
+			public const int MaxPlayers = 32;
+			public const int MaxActions = 8;
+			public const int MaxCash = 1_000_000;
+			public const int MaxTicks = 900;
+			public const int MaxPlacementRadius = 64;
+			public const int MaxIdLength = 64;
+
+			public readonly string RequestPath;
+			public readonly string ReportPath;
+			public readonly string ReadyPath;
+			public readonly string Map;
+			public readonly string ScreenshotDirectory;
+			public long LastCompletedSequence;
+			public string LastRejectedRequestFingerprint;
+
+			public FuzzSession(string requestPath, string reportPath, string readyPath, string map, string screenshotDirectory)
+			{
+				RequestPath = requestPath;
+				ReportPath = reportPath;
+				ReadyPath = readyPath;
+				Map = map;
+				ScreenshotDirectory = screenshotDirectory;
+			}
+		}
+
+		sealed record FuzzRequest(long Sequence, JsonObject FuzzState);
 
 		sealed class ProbeAction
 		{
