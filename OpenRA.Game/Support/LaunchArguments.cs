@@ -58,6 +58,18 @@ namespace OpenRA
 		[Desc("Internal WarpTest C3 harness: optionally save a post-candidate screenshot for each sequenced fuzz request.")]
 		public string WarptestFuzzScreenshotDir;
 
+		[Desc("Internal WarpTest C1 background-pixel request mailbox.")]
+		public string WarptestBackgroundRequestPath;
+
+		[Desc("Internal WarpTest C1 background-pixel response mailbox.")]
+		public string WarptestBackgroundResponsePath;
+
+		[Desc("Internal WarpTest C1 random session nonce.")]
+		public string WarptestBackgroundSessionId;
+
+		[Desc("Internal WarpTest C1 contained session root.")]
+		public string WarptestBackgroundRoot;
+
 		public LaunchArguments(Arguments args)
 		{
 			if (args == null)

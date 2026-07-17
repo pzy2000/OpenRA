@@ -51,6 +51,11 @@ namespace OpenRA.Mods.Common.LoadScreens
 				Launch.WarptestScreenshotPath,
 				Launch.WarptestScreenshotFrame,
 				Launch.WarptestExitAfterScreenshot);
+			Game.ConfigureWarptestBackgroundPixel(
+				Launch.WarptestBackgroundRequestPath,
+				Launch.WarptestBackgroundResponsePath,
+				Launch.WarptestBackgroundSessionId,
+				Launch.WarptestBackgroundRoot);
 			WarptestGameplayProbe.Configure(
 				Launch.WarptestGameplayRequestPath,
 				Launch.WarptestGameplayReportPath);

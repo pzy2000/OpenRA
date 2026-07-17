@@ -18,6 +18,8 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Runtime;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using OpenRA.Graphics;
 using OpenRA.Network;
@@ -73,7 +75,17 @@ namespace OpenRA
 		static WPos warptestGameplayProbeCenter;
 		static string warptestFuzzScreenshotPath = null;
 		static Action<string> warptestFuzzScreenshotCallback = null;
+		static string warptestBackgroundRequestPath;
+		static string warptestBackgroundResponsePath;
+		static string warptestBackgroundSessionId;
+		static string warptestBackgroundRoot;
+		static int warptestBackgroundSequence;
+		static int warptestBackgroundFrameId = -1;
+		static bool warptestBackgroundFrameConsumed = true;
+		static string warptestBackgroundLastBatchId;
+		static JsonObject warptestBackgroundLastReceipt;
 		static bool WarptestScreenshotPending => !warptestScreenshotTaken && !string.IsNullOrEmpty(warptestScreenshotPath);
+		static bool WarptestBackgroundPending => !string.IsNullOrEmpty(warptestBackgroundRequestPath) && File.Exists(warptestBackgroundRequestPath);
 
 		public static event Action OnShellmapLoaded = () => { };
 
@@ -756,6 +768,247 @@ namespace OpenRA
 			}
 		}
 
+		public static void ConfigureWarptestBackgroundPixel(string requestPath, string responsePath, string sessionId, string root)
+		{
+			warptestBackgroundRequestPath = string.IsNullOrEmpty(requestPath) ? null : Path.GetFullPath(requestPath);
+			warptestBackgroundResponsePath = string.IsNullOrEmpty(responsePath) ? null : Path.GetFullPath(responsePath);
+			warptestBackgroundSessionId = sessionId;
+			warptestBackgroundRoot = string.IsNullOrEmpty(root) ? null : Path.GetFullPath(root);
+			warptestBackgroundSequence = 0;
+			warptestBackgroundFrameId = -1;
+			warptestBackgroundFrameConsumed = true;
+			warptestBackgroundLastBatchId = null;
+			warptestBackgroundLastReceipt = null;
+		}
+
+		static Modifiers WarptestModifiers(JsonObject action)
+		{
+			var result = Modifiers.None;
+			if (action["modifiers"] is not JsonArray values)
+				return result;
+			foreach (var value in values)
+			{
+				var name = value?.GetValue<string>()?.ToLowerInvariant();
+				result |= name switch
+				{
+					"shift" => Modifiers.Shift,
+					"ctrl" or "control" => Modifiers.Ctrl,
+					"alt" or "option" => Modifiers.Alt,
+					"meta" or "command" or "cmd" => Modifiers.Meta,
+					_ => throw new InvalidDataException($"Unsupported modifier: {name}")
+				};
+			}
+			return result;
+		}
+
+		static Keycode WarptestKeycode(string raw)
+		{
+			var name = (raw ?? "").Trim();
+			if (name.Length == 1 && char.IsLetterOrDigit(name[0]))
+				name = char.IsDigit(name[0]) ? "NUMBER_" + name : name.ToUpperInvariant();
+			name = name.ToLowerInvariant() switch
+			{
+				"enter" or "return" => "RETURN",
+				"escape" or "esc" => "ESCAPE",
+				"backspace" => "BACKSPACE",
+				"delete" => "DELETE",
+				"tab" => "TAB",
+				"space" => "SPACE",
+				"left" => "LEFT",
+				"right" => "RIGHT",
+				"up" => "UP",
+				"down" => "DOWN",
+				"home" => "HOME",
+				"end" => "END",
+				"pageup" => "PAGEUP",
+				"pagedown" => "PAGEDOWN",
+				_ => name
+			};
+			if (!Enum.TryParse<Keycode>(name, true, out var key))
+				throw new InvalidDataException($"Unsupported key: {raw}");
+			return key;
+		}
+
+		static int WarptestTapKey(DefaultInputHandler input, string key, Modifiers modifiers)
+		{
+			var code = WarptestKeycode(key);
+			input.ModifierKeys(modifiers);
+			input.OnKeyInput(new KeyInput { Event = KeyInputEvent.Down, Key = code, Modifiers = modifiers });
+			input.OnKeyInput(new KeyInput { Event = KeyInputEvent.Up, Key = code, Modifiers = modifiers });
+			input.ModifierKeys(Modifiers.None);
+			return 2;
+		}
+
+		static int2 WarptestPoint(JsonObject action, string xName = "x", string yName = "y")
+		{
+			var point = new int2(action[xName]?.GetValue<int>() ?? -1, action[yName]?.GetValue<int>() ?? -1);
+			if (point.X < 0 || point.X >= 1280 || point.Y < 0 || point.Y >= 720)
+				throw new InvalidDataException($"Input coordinate {point} is outside 1280x720.");
+			return point;
+		}
+
+		static int WarptestDispatchAction(DefaultInputHandler input, JsonObject action)
+		{
+			var kind = action["kind"]?.GetValue<string>();
+			if (kind is "done" or "fail") return 0;
+			if (kind == "wait")
+			{
+				var seconds = action["seconds"]?.GetValue<double>() ?? 0;
+				if (seconds < 0 || seconds > 5) throw new InvalidDataException("Wait duration is outside 0..5 seconds.");
+				return 0;
+			}
+			var modifiers = WarptestModifiers(action);
+			if (kind == "key") return WarptestTapKey(input, action["key"]?.GetValue<string>(), modifiers);
+			if (kind == "type")
+			{
+				var count = 0;
+				if (action["x"] != null && action["y"] != null)
+				{
+					var point = WarptestPoint(action);
+					input.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, point, int2.Zero, Modifiers.None, 1));
+					input.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, point, int2.Zero, Modifiers.None, 1));
+					count += 2;
+				}
+				if (action["overwrite"]?.GetValue<bool>() == true)
+				{
+					count += WarptestTapKey(input, "a", Modifiers.Meta);
+					count += WarptestTapKey(input, "backspace", Modifiers.None);
+				}
+				var text = action["text"]?.GetValue<string>() ?? "";
+				if (text.Length > 4096) throw new InvalidDataException("Input text exceeds 4096 characters.");
+				input.OnTextInput(text);
+				count++;
+				if (action["enter"]?.GetValue<bool>() == true) count += WarptestTapKey(input, "enter", Modifiers.None);
+				return count;
+			}
+			if (kind == "click")
+			{
+				var point = WarptestPoint(action);
+				var button = (action["button"]?.GetValue<string>() ?? "left") switch
+				{
+					"right" => MouseButton.Right,
+					"middle" => MouseButton.Middle,
+					_ => MouseButton.Left
+				};
+				var clicks = action["clicks"]?.GetValue<int>() ?? 1;
+				if (clicks < 1 || clicks > 3) throw new InvalidDataException("Click count is outside 1..3.");
+				input.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.None, point, int2.Zero, modifiers, 0));
+				for (var i = 0; i < clicks; i++)
+				{
+					input.OnMouseInput(new MouseInput(MouseInputEvent.Down, button, point, int2.Zero, modifiers, clicks));
+					input.OnMouseInput(new MouseInput(MouseInputEvent.Up, button, point, int2.Zero, modifiers, clicks));
+				}
+				return 1 + 2 * clicks;
+			}
+			if (kind == "scroll")
+			{
+				var point = WarptestPoint(action);
+				var delta = new int2(action["dx"]?.GetValue<int>() ?? 0, action["dy"]?.GetValue<int>() ?? 0);
+				input.OnMouseInput(new MouseInput(MouseInputEvent.Scroll, MouseButton.None, point, delta, modifiers, 0));
+				return 1;
+			}
+			if (kind == "drag")
+			{
+				var duration = action["duration"]?.GetValue<double>() ?? 0;
+				if (duration < 0 || duration > 5) throw new InvalidDataException("Drag duration is outside 0..5 seconds.");
+				var start = WarptestPoint(action);
+				var end = WarptestPoint(action, "x2", "y2");
+				input.OnMouseInput(new MouseInput(MouseInputEvent.Down, MouseButton.Left, start, int2.Zero, modifiers, 1));
+				for (var step = 1; step <= 6; step++)
+				{
+					var point = new int2(start.X + (end.X - start.X) * step / 6, start.Y + (end.Y - start.Y) * step / 6);
+					input.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Left, point, point - start, modifiers, 0));
+				}
+				input.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, end, int2.Zero, modifiers, 1));
+				return 8;
+			}
+			throw new InvalidDataException($"Unsupported input action: {kind}");
+		}
+
+		static void WriteWarptestBackgroundResponse(JsonObject response)
+		{
+			var temporary = warptestBackgroundResponsePath + ".tmp";
+			File.WriteAllText(temporary, response.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+			File.Move(temporary, warptestBackgroundResponsePath, true);
+		}
+
+		static void MaybeProcessWarptestBackground(DefaultInputHandler input)
+		{
+			if (!WarptestBackgroundPending || string.IsNullOrEmpty(warptestBackgroundResponsePath) ||
+				string.IsNullOrEmpty(warptestBackgroundSessionId) || string.IsNullOrEmpty(warptestBackgroundRoot))
+				return;
+			try
+			{
+				var request = JsonNode.Parse(File.ReadAllText(warptestBackgroundRequestPath))?.AsObject();
+				var sequence = request?["sequence"]?.GetValue<int>() ?? -1;
+				if (sequence <= warptestBackgroundSequence) return;
+				var operation = request["operation"]?.GetValue<string>() ?? "";
+				var response = new JsonObject
+				{
+					["schema_version"] = 1, ["sequence"] = sequence, ["session_id"] = warptestBackgroundSessionId,
+					["operation"] = operation, ["status"] = "rejected", ["accepted"] = false,
+					["event_count"] = 0, ["error"] = ""
+				};
+				if (request["session_id"]?.GetValue<string>() != warptestBackgroundSessionId)
+					response["error"] = "session nonce mismatch";
+				else if (sequence != warptestBackgroundSequence + 1)
+					response["error"] = "request sequence gap";
+				else if (operation == "capture")
+				{
+					var path = Path.GetFullPath(request["output_path"]?.GetValue<string>() ?? "");
+					var rootPrefix = warptestBackgroundRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+					if (!path.StartsWith(rootPrefix, StringComparison.Ordinal)) throw new InvalidDataException("Capture path escapes session root.");
+					if (Renderer.Resolution.Width != 1280 || Renderer.Resolution.Height != 720)
+						throw new InvalidDataException($"Renderer size drifted to {Renderer.Resolution}; expected 1280x720.");
+					Directory.CreateDirectory(Path.GetDirectoryName(path));
+					Renderer.SaveScreenshotSync(path);
+					warptestBackgroundFrameId++;
+					warptestBackgroundFrameConsumed = false;
+					response["status"] = "success"; response["accepted"] = true;
+					response["frame_id"] = warptestBackgroundFrameId; response["width"] = 1280; response["height"] = 720;
+					response["capture_backend"] = "openra_renderer_save_screenshot_sync_v1";
+				}
+				else if (operation == "input_batch")
+				{
+					var batchId = request["batch_id"]?.GetValue<string>() ?? "";
+					if (batchId.Length > 0 && batchId == warptestBackgroundLastBatchId)
+					{
+						response = warptestBackgroundLastReceipt.DeepClone().AsObject();
+						response["sequence"] = sequence;
+					}
+					else
+					{
+						var frameId = request["frame_id"]?.GetValue<int>() ?? -1;
+						if (frameId != warptestBackgroundFrameId || warptestBackgroundFrameConsumed)
+							throw new InvalidDataException("Input batch references a stale or consumed frame.");
+						if (request["actions"] is not JsonArray actions || actions.Count < 1 || actions.Count > 64)
+							throw new InvalidDataException("Input batch action count is outside 1..64.");
+						var eventCount = 0;
+						foreach (var action in actions) eventCount += WarptestDispatchAction(input, action.AsObject());
+						warptestBackgroundFrameConsumed = true;
+						response["status"] = "success"; response["accepted"] = true; response["batch_id"] = batchId;
+						response["event_count"] = eventCount; response["resulting_frame_id"] = frameId + 1;
+						response["input_backend"] = "openra_default_input_handler_v1";
+						warptestBackgroundLastBatchId = batchId;
+						warptestBackgroundLastReceipt = response.DeepClone().AsObject();
+					}
+				}
+				else response["error"] = "unsupported background operation";
+				warptestBackgroundSequence = sequence;
+				WriteWarptestBackgroundResponse(response);
+			}
+			catch (Exception e)
+			{
+				warptestBackgroundSequence++;
+				WriteWarptestBackgroundResponse(new JsonObject
+				{
+					["schema_version"] = 1, ["sequence"] = warptestBackgroundSequence,
+					["session_id"] = warptestBackgroundSessionId, ["operation"] = "error",
+					["status"] = "rejected", ["accepted"] = false, ["event_count"] = 0, ["error"] = e.Message
+				});
+			}
+		}
+
 		// WarpTest harness: the gameplay probe (OpenRA.Mods.Common) signals that it is
 		// driving deterministic actions so the screenshot is deferred until those
 		// actions complete instead of firing on an early clean-launch frame.
@@ -934,8 +1187,11 @@ namespace OpenRA
 					}
 				}
 
+				var inputHandler = new DefaultInputHandler(OrderManager.World);
 				using (new PerfSample("render_flip"))
-					Renderer.EndFrame(new DefaultInputHandler(OrderManager.World));
+					Renderer.EndFrame(inputHandler);
+
+				MaybeProcessWarptestBackground(inputHandler);
 
 				MaybeTakeWarptestScreenshot();
 				MaybeTakeWarptestFuzzScreenshot();
@@ -1050,7 +1306,7 @@ namespace OpenRA
 
 					var haveSomeTimeUntilNextLogic = now < nextLogic;
 					var isTimeToRender = now >= nextRender;
-					if (!Renderer.WindowIsSuspended || WarptestScreenshotPending)
+					if (!Renderer.WindowIsSuspended || WarptestScreenshotPending || WarptestBackgroundPending)
 					{
 						if (isTimeToRender || forceRender)
 						{
