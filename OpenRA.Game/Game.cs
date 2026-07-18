@@ -798,6 +798,7 @@ namespace OpenRA
 					_ => throw new InvalidDataException($"Unsupported modifier: {name}")
 				};
 			}
+
 			return result;
 		}
 
@@ -857,6 +858,7 @@ namespace OpenRA
 				if (seconds < 0 || seconds > 5) throw new InvalidDataException("Wait duration is outside 0..5 seconds.");
 				return 0;
 			}
+
 			var modifiers = WarptestModifiers(action);
 			if (kind == "key") return WarptestTapKey(input, action["key"]?.GetValue<string>(), modifiers);
 			if (kind == "type")
@@ -869,11 +871,13 @@ namespace OpenRA
 					input.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, point, int2.Zero, Modifiers.None, 1));
 					count += 2;
 				}
+
 				if (action["overwrite"]?.GetValue<bool>() == true)
 				{
 					count += WarptestTapKey(input, "a", Modifiers.Meta);
 					count += WarptestTapKey(input, "backspace", Modifiers.None);
 				}
+
 				var text = action["text"]?.GetValue<string>() ?? "";
 				if (text.Length > 4096) throw new InvalidDataException("Input text exceeds 4096 characters.");
 				input.OnTextInput(text);
@@ -881,6 +885,7 @@ namespace OpenRA
 				if (action["enter"]?.GetValue<bool>() == true) count += WarptestTapKey(input, "enter", Modifiers.None);
 				return count;
 			}
+
 			if (kind == "click")
 			{
 				var point = WarptestPoint(action);
@@ -898,8 +903,10 @@ namespace OpenRA
 					input.OnMouseInput(new MouseInput(MouseInputEvent.Down, button, point, int2.Zero, modifiers, clicks));
 					input.OnMouseInput(new MouseInput(MouseInputEvent.Up, button, point, int2.Zero, modifiers, clicks));
 				}
+
 				return 1 + 2 * clicks;
 			}
+
 			if (kind == "scroll")
 			{
 				var point = WarptestPoint(action);
@@ -907,6 +914,7 @@ namespace OpenRA
 				input.OnMouseInput(new MouseInput(MouseInputEvent.Scroll, MouseButton.None, point, delta, modifiers, 0));
 				return 1;
 			}
+
 			if (kind == "drag")
 			{
 				var duration = action["duration"]?.GetValue<double>() ?? 0;
@@ -919,9 +927,11 @@ namespace OpenRA
 					var point = new int2(start.X + (end.X - start.X) * step / 6, start.Y + (end.Y - start.Y) * step / 6);
 					input.OnMouseInput(new MouseInput(MouseInputEvent.Move, MouseButton.Left, point, point - start, modifiers, 0));
 				}
+
 				input.OnMouseInput(new MouseInput(MouseInputEvent.Up, MouseButton.Left, end, int2.Zero, modifiers, 1));
 				return 8;
 			}
+
 			throw new InvalidDataException($"Unsupported input action: {kind}");
 		}
 
@@ -945,9 +955,14 @@ namespace OpenRA
 				var operation = request["operation"]?.GetValue<string>() ?? "";
 				var response = new JsonObject
 				{
-					["schema_version"] = 1, ["sequence"] = sequence, ["session_id"] = warptestBackgroundSessionId,
-					["operation"] = operation, ["status"] = "rejected", ["accepted"] = false,
-					["event_count"] = 0, ["error"] = ""
+					["schema_version"] = 1,
+					["sequence"] = sequence,
+					["session_id"] = warptestBackgroundSessionId,
+					["operation"] = operation,
+					["status"] = "rejected",
+					["accepted"] = false,
+					["event_count"] = 0,
+					["error"] = ""
 				};
 				if (request["session_id"]?.GetValue<string>() != warptestBackgroundSessionId)
 					response["error"] = "session nonce mismatch";
@@ -1002,9 +1017,14 @@ namespace OpenRA
 				warptestBackgroundSequence++;
 				WriteWarptestBackgroundResponse(new JsonObject
 				{
-					["schema_version"] = 1, ["sequence"] = warptestBackgroundSequence,
-					["session_id"] = warptestBackgroundSessionId, ["operation"] = "error",
-					["status"] = "rejected", ["accepted"] = false, ["event_count"] = 0, ["error"] = e.Message
+					["schema_version"] = 1,
+					["sequence"] = warptestBackgroundSequence,
+					["session_id"] = warptestBackgroundSessionId,
+					["operation"] = "error",
+					["status"] = "rejected",
+					["accepted"] = false,
+					["event_count"] = 0,
+					["error"] = e.Message
 				});
 			}
 		}

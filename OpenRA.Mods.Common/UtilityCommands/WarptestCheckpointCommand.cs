@@ -32,7 +32,7 @@ namespace OpenRA.Mods.Common.UtilityCommands
 			@"Add(?<type>Primary|Secondary)Objective\s*\(\s*(?<owner>[A-Za-z0-9_]+)\s*,\s*""(?<id>[^""]*)""",
 			RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-		static readonly Regex SafeIdRegex = new(@"^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+		static readonly Regex SafeIdRegex = new("^[A-Za-z0-9][A-Za-z0-9_.-]*$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
 		string IUtilityCommand.Name => "--warptest-checkpoint";
 
@@ -82,13 +82,19 @@ namespace OpenRA.Mods.Common.UtilityCommands
 				var mapsRoot = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "mods", mod, "maps"));
 				var mapDir = Path.GetFullPath(Path.Combine(mapsRoot, map));
 				var mapYamlPath = Path.Combine(mapDir, "map.yaml");
-				report.Add("target.map_path_confined", mapDir.StartsWith(mapsRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal), "Map path stays inside the selected mod maps directory.", mapDir, mapsRoot);
+				report.Add(
+					"target.map_path_confined",
+					mapDir.StartsWith(mapsRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal),
+					"Map path stays inside the selected mod maps directory.",
+					mapDir,
+					mapsRoot);
 				if (!mapDir.StartsWith(mapsRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
 				{
 					WriteReport(outputPath, report);
 					Environment.Exit(1);
 					return;
 				}
+
 				report.Add("target.map_exists", File.Exists(mapYamlPath), "Map directory contains map.yaml.", mapYamlPath, File.Exists(mapYamlPath));
 				if (!File.Exists(mapYamlPath))
 				{
