@@ -224,14 +224,20 @@ namespace OpenRA.Platforms.Default
 
 				Console.WriteLine($"Using resolution: {windowSize.Width}x{windowSize.Height}");
 
-				const SDL.SDL_WindowFlags WindowFlags = SDL.SDL_WindowFlags.SDL_WINDOW_OPENGL | SDL.SDL_WindowFlags.SDL_WINDOW_ALLOW_HIGHDPI;
+				var windowFlags = SDL.SDL_WindowFlags.SDL_WINDOW_OPENGL | SDL.SDL_WindowFlags.SDL_WINDOW_ALLOW_HIGHDPI;
+				// WarpTest C1 captures the renderer-owned framebuffer and dispatches
+				// application-local SDL events, so its isolated macOS child must not map
+				// a window onto the operator's desktop. Normal OpenRA launches are
+				// unchanged because only the C1 harness sets this environment variable.
+				if (Environment.GetEnvironmentVariable("WARPTEST_C1_BACKGROUND_WINDOW") == "1")
+					windowFlags |= SDL.SDL_WindowFlags.SDL_WINDOW_HIDDEN;
 
 				// HiDPI doesn't work properly on OSX with (legacy) fullscreen mode
 				if (Platform.CurrentPlatform == PlatformType.OSX && windowMode == WindowMode.Fullscreen)
 					SDL.SDL_SetHint(SDL.SDL_HINT_VIDEO_HIGHDPI_DISABLED, "1");
 
 				window = SDL.SDL_CreateWindow("OpenRA", SDL.SDL_WINDOWPOS_CENTERED_DISPLAY(videoDisplay), SDL.SDL_WINDOWPOS_CENTERED_DISPLAY(videoDisplay),
-					windowSize.Width, windowSize.Height, WindowFlags);
+					windowSize.Width, windowSize.Height, windowFlags);
 
 				if (Platform.CurrentPlatform == PlatformType.Linux)
 				{
