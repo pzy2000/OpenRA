@@ -17,6 +17,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using OpenRA.Graphics;
+using OpenRA.Primitives;
 using OpenRA.Traits;
 
 namespace OpenRA.Mods.Common.Traits
@@ -54,6 +55,9 @@ namespace OpenRA.Mods.Common.Traits
 		bool active;
 		bool setupApplied;
 		bool finished;
+		bool interactive;
+		bool interactiveReady;
+		long interactiveSequence;
 		bool fuzzReadyPending;
 		bool fuzzCandidateActive;
 		long fuzzSequence;
@@ -107,7 +111,10 @@ namespace OpenRA.Mods.Common.Traits
 				actions = spec["actions"] as JsonArray ?? [];
 				assertions = spec["assertions"] as JsonArray ?? [];
 				setup = (spec["setup"] as JsonObject)?["openra_gameplay_probe"] as JsonObject;
+				interactive = setup?["interactive"]?.GetValue<bool>() == true;
 				CaptureInitialActors();
+				if (interactive)
+					Game.NotifyWarptestGameplayProbeConfigured(false);
 			}
 			catch (Exception e)
 			{
@@ -131,8 +138,22 @@ namespace OpenRA.Mods.Common.Traits
 			{
 				if (!setupApplied)
 				{
+					var setupDelayTicks = ReadInt(setup, "delay_ticks", 0);
+					if (world.WorldTick < setupDelayTicks)
+						return;
 					ApplySetup();
 					setupApplied = true;
+				}
+
+				if (interactive)
+				{
+					if (!interactiveReady)
+					{
+						interactiveReady = true;
+						WriteInteractiveReport(0, true, "OpenRA interactive gameplay probe is ready.");
+					}
+					TryProcessInteractiveRequest();
+					return;
 				}
 
 				if (current == null && actionIndex < actions.Count)
@@ -477,6 +498,7 @@ namespace OpenRA.Mods.Common.Traits
 			var cash = ReadInt(setup, "cash", 0);
 			var fastBuild = ReadBool(setup, "fast_build", false);
 			var buildAnywhere = ReadBool(setup, "build_anywhere", false);
+			var allTech = ReadBool(setup, "all_tech", false);
 
 			foreach (var player in world.Players.Where(p => !p.NonCombatant))
 			{
@@ -491,7 +513,61 @@ namespace OpenRA.Mods.Common.Traits
 					player.PlayerActor.ResolveOrder(new Order(DeveloperMode.Orders.FastBuild, player.PlayerActor, false));
 				if (buildAnywhere && !dev.BuildAnywhere)
 					player.PlayerActor.ResolveOrder(new Order(DeveloperMode.Orders.BuildAnywhere, player.PlayerActor, false));
+				if (allTech && !dev.AllTech)
+					player.PlayerActor.ResolveOrder(new Order(DeveloperMode.Orders.EnableTech, player.PlayerActor, false));
 			}
+
+			if (setup["remove_player_actor_types"] is JsonObject removals)
+				foreach (var entry in removals)
+				{
+					var player = FindPlayer(entry.Key);
+					if (player == null || entry.Value is not JsonArray types)
+						throw new InvalidDataException($"Invalid setup actor removal player: {entry.Key}.");
+					var allowedTypes = types
+						.Select(type => type?.GetValue<string>() ?? "")
+						.Where(type => SafeIdRegex.IsMatch(type))
+						.ToHashSet(StringComparer.OrdinalIgnoreCase);
+					foreach (var actor in world.Actors
+						.Where(a => a.IsInWorld && !a.IsDead && a.Owner == player && allowedTypes.Contains(a.Info.Name))
+						.ToArray())
+						actor.Dispose();
+				}
+
+			if (setup["actor_positions"] is JsonArray positions)
+				foreach (var node in positions)
+				{
+					if (node is not JsonObject position)
+						continue;
+					var actorId = ReadString(position, "actor_id");
+					if (!TryParseCell(ReadString(position, "cell"), out var cell))
+						throw new InvalidDataException($"Invalid setup actor position for {actorId}.");
+					var actor = FindMapActor(actorId);
+					var mobile = actor?.TraitOrDefault<Mobile>();
+					if (actor == null || mobile == null)
+						throw new InvalidDataException($"Setup actor {actorId} is missing or not mobile.");
+					mobile.SetCenterPosition(actor, world.Map.CenterOfCell(cell));
+				}
+
+			if (setup["spawn_actors"] is JsonArray spawns)
+				foreach (var node in spawns)
+				{
+					if (node is not JsonObject spawn)
+						continue;
+					var player = FindPlayer(ReadString(spawn, "player"));
+					var actorType = ReadString(spawn, "actor");
+					var faction = ReadString(spawn, "faction") ?? player?.Faction.InternalName;
+					if (player == null || !SafeIdRegex.IsMatch(actorType ?? "") ||
+						!SafeIdRegex.IsMatch(faction ?? "") ||
+						!TryParseCell(ReadString(spawn, "cell"), out var cell))
+						throw new InvalidDataException("Invalid setup actor spawn.");
+					var actor = world.CreateActor(false, actorType, new TypeDictionary
+					{
+						new OwnerInit(player),
+						new FactionInit(faction),
+						new LocationInit(cell),
+					});
+					world.AddFrameEndTask(w => w.Add(actor));
+				}
 		}
 
 		void StartAction(JsonObject action)
@@ -515,6 +591,12 @@ namespace OpenRA.Mods.Common.Traits
 					break;
 				case "openra_build_actor":
 					StartBuildAction(current);
+					break;
+				case "openra_build_group":
+					StartBuildGroupAction(current);
+					break;
+				case "openra_rally_group":
+					StartRallyGroupAction(current);
 					break;
 				default:
 					Fail($"actions.{actionIndex}.type", $"Unsupported OpenRA gameplay action type: {current.Type}");
@@ -548,6 +630,12 @@ namespace OpenRA.Mods.Common.Traits
 					break;
 				case "openra_build_actor":
 					TickBuildAction(current);
+					break;
+				case "openra_build_group":
+					TickBuildGroupAction(current);
+					break;
+				case "openra_rally_group":
+					TickRallyGroupAction(current);
 					break;
 			}
 		}
@@ -748,6 +836,149 @@ namespace OpenRA.Mods.Common.Traits
 			}
 		}
 
+		void StartBuildGroupAction(ProbeAction action)
+		{
+			action.PlayerId = ReadString(action.Node, "player");
+			action.TimeoutTicks = ReadInt(action.Node, "timeout_ticks", 1200);
+			action.Player = FindPlayer(action.PlayerId);
+			if (action.Player == null)
+			{
+				Fail($"actions.{action.Index}.player", $"Unknown player: {action.PlayerId}");
+				CompleteCurrentAction(false);
+				return;
+			}
+
+			primaryPlayer ??= action.Player;
+			var units = action.Node["units"] as JsonArray ?? [];
+			if (units.Count == 0)
+			{
+				Fail($"actions.{action.Index}.units", "Production group must contain at least one unit.");
+				CompleteCurrentAction(false);
+				return;
+			}
+
+			foreach (var unitNode in units)
+			{
+				if (unitNode is not JsonObject unit)
+				{
+					Fail($"actions.{action.Index}.units", "Production group entries must be objects.");
+					CompleteCurrentAction(false);
+					return;
+				}
+
+				var actorType = ReadString(unit, "actor");
+				var queueType = ReadString(unit, "queue") ?? "Infantry";
+				var count = Math.Max(1, ReadInt(unit, "count", 1));
+				var actorInfo = FindActorInfo(actorType);
+				var queue = world.ActorsWithTrait<ProductionQueue>()
+					.Where(q => q.Actor.Owner == action.Player && q.Trait.Info.Type == queueType)
+					.Select(q => q.Trait)
+					.FirstOrDefault(q => q.BuildableItems().Any(i => i.Name == actorType));
+				if (actorInfo == null || queue == null || !queue.CanBuild(actorInfo))
+				{
+					Fail(
+						$"actions.{action.Index}.units",
+						$"{action.PlayerId} cannot currently build {count}x {actorType} on {queueType}.");
+					buildAttempts.Add(new BuildAttempt(action.PlayerId, actorType, false, queue != null));
+					CompleteCurrentAction(false);
+					return;
+				}
+
+				var baseline = CountNewActors(action.PlayerId, actorType);
+				queue.Actor.ResolveOrder(Order.StartProduction(queue.Actor, actorType, count, false));
+				action.GroupBuildItems.Add(new GroupBuildItem(actorType, count, baseline));
+				buildAttempts.Add(new BuildAttempt(action.PlayerId, actorType, true, true));
+			}
+
+			checks.Add(ProbeCheck.Success(
+				$"actions.{action.Index}.start",
+				$"Queued {action.GroupBuildItems.Count} registered production-group entries."));
+		}
+
+		void TickBuildGroupAction(ProbeAction action)
+		{
+			var complete = action.GroupBuildItems.All(item =>
+				CountNewActors(action.PlayerId, item.Actor) >= item.BaselineCount + item.Count);
+			if (!complete)
+				return;
+
+			checks.Add(ProbeCheck.Success(
+				$"actions.{action.Index}.complete",
+				"All registered combined-arms units completed production."));
+			CompleteCurrentAction(true);
+		}
+
+		void StartRallyGroupAction(ProbeAction action)
+		{
+			action.PlayerId = ReadString(action.Node, "player");
+			action.TimeoutTicks = ReadInt(action.Node, "timeout_ticks", 1200);
+			action.Radius = Math.Max(0, ReadInt(action.Node, "radius", 3));
+			action.Player = FindPlayer(action.PlayerId);
+			if (action.Player == null || !TryParseCell(ReadString(action.Node, "center"), out action.TargetCell))
+			{
+				Fail($"actions.{action.Index}.rally", "Rally action requires a known player and valid center cell.");
+				CompleteCurrentAction(false);
+				return;
+			}
+
+			var actors = action.Node["actors"] as JsonArray ?? [];
+			foreach (var actorNode in actors)
+			{
+				if (actorNode is not JsonObject actorSpec)
+				continue;
+
+				var actorType = ReadString(actorSpec, "actor");
+				var count = Math.Max(1, ReadInt(actorSpec, "count", 1));
+				initialActorIds.TryGetValue((action.PlayerId.ToLowerInvariant(), actorType.ToLowerInvariant()), out var initial);
+				initial ??= [];
+				var selected = world.Actors
+					.Where(a => a.IsInWorld && !a.IsDead && a.Owner == action.Player
+						&& string.Equals(a.Info.Name, actorType, StringComparison.OrdinalIgnoreCase)
+						&& !initial.Contains(a.ActorID))
+					.OrderByDescending(a => a.ActorID)
+					.Take(count)
+					.ToArray();
+				if (selected.Length < count)
+				{
+					Fail($"actions.{action.Index}.actors", $"Rally group is missing {actorType}: expected {count}, found {selected.Length}.");
+					CompleteCurrentAction(false);
+					return;
+				}
+
+				action.GroupActors.AddRange(selected);
+			}
+
+			if (action.GroupActors.Count == 0)
+			{
+				Fail($"actions.{action.Index}.actors", "Rally group resolved to no actors.");
+				CompleteCurrentAction(false);
+				return;
+			}
+
+			foreach (var actor in action.GroupActors)
+				actor.ResolveOrder(new Order("Move", actor, Target.FromCell(world, action.TargetCell), false));
+
+			checks.Add(ProbeCheck.Success(
+				$"actions.{action.Index}.start",
+				$"Issued rally orders for {action.GroupActors.Count} actors toward {action.TargetCell}."));
+		}
+
+		void TickRallyGroupAction(ProbeAction action)
+		{
+			var complete = action.GroupActors.All(actor =>
+				actor.IsInWorld && !actor.IsDead
+				&& Math.Max(
+					Math.Abs(actor.Location.X - action.TargetCell.X),
+					Math.Abs(actor.Location.Y - action.TargetCell.Y)) <= action.Radius);
+			if (!complete)
+				return;
+
+			checks.Add(ProbeCheck.Success(
+				$"actions.{action.Index}.complete",
+				$"All {action.GroupActors.Count} actors reached the registered rally region."));
+			CompleteCurrentAction(true);
+		}
+
 		bool TryFindPlacement(ProbeAction action, out CPos cell, out string error)
 		{
 			var bi = action.ActorInfo.TraitInfo<BuildingInfo>();
@@ -853,6 +1084,9 @@ namespace OpenRA.Mods.Common.Traits
 					case "openra_production_prerequisite_respected":
 						CheckPrerequisiteRespected(i, assertion);
 						break;
+					case "openra_actor_group_in_region":
+						CheckActorGroupInRegion(i, assertion);
+						break;
 					case "no_openra_gameplay_probe_errors":
 						AddCheck($"assertions.{i}.no_probe_errors", errors.Count == 0, "Gameplay probe recorded no errors.", 0, errors.Count);
 						break;
@@ -890,8 +1124,133 @@ namespace OpenRA.Mods.Common.Traits
 			var player = ReadString(assertion, "player");
 			var actor = ReadString(assertion, "actor");
 			var attempts = buildAttempts.Where(a => a.Player == player && a.Actor == actor).ToArray();
-			var ok = attempts.Length > 0 && attempts.All(a => a.QueueAccepted && a.PrerequisiteRespected);
+			var ok = attempts.Length > 0
+				? attempts.All(a => a.QueueAccepted && a.PrerequisiteRespected)
+				: InteractivePrerequisitesPresent(player, actor);
 			AddCheck($"assertions.{index}.prerequisite_respected", ok, $"{player} only produced {actor} after prerequisites were available.", true, ok);
+		}
+
+		bool InteractivePrerequisitesPresent(string playerId, string actorType)
+		{
+			if (!interactive)
+				return false;
+
+			var player = FindPlayer(playerId);
+			if (player == null || CountNewActors(playerId, actorType) < 1)
+				return false;
+
+			var prerequisites = actorType.ToLowerInvariant() switch
+			{
+				"2tnk" => new[] { "powr", "proc", "tent", "weap" },
+				"e3" => new[] { "powr", "proc", playerId.Equals("USSR", StringComparison.OrdinalIgnoreCase) ? "barr" : "tent", "dome" },
+				_ => Array.Empty<string>(),
+			};
+			return prerequisites.Length > 0 && prerequisites.All(required =>
+				world.Actors.Any(a => a.IsInWorld && !a.IsDead && a.Owner == player
+					&& string.Equals(a.Info.Name, required, StringComparison.OrdinalIgnoreCase)));
+		}
+
+		void TryProcessInteractiveRequest()
+		{
+			if (!File.Exists(requestPath))
+				return;
+
+			JsonObject request;
+			try
+			{
+				request = JsonNode.Parse(File.ReadAllText(requestPath)) as JsonObject;
+			}
+			catch
+			{
+				return;
+			}
+
+			var sequence = request?["sequence"]?.GetValue<long>() ?? 0;
+			if (sequence <= interactiveSequence)
+				return;
+
+			interactiveSequence = sequence;
+			checks.Clear();
+			errors.Clear();
+			assertions = request["assertions"] as JsonArray ?? [];
+			try
+			{
+				EvaluateAssertions();
+				var success = checks.All(c => c.Status == "success") && errors.Count == 0;
+				WriteInteractiveReport(
+					sequence,
+					success,
+					success ? "OpenRA live gameplay assertions passed." : "OpenRA live gameplay assertions failed.");
+			}
+			catch (Exception e)
+			{
+				Fail("interactive.exception", e.ToString());
+				WriteInteractiveReport(sequence, false, "OpenRA live gameplay assertion probe failed.");
+			}
+		}
+
+		void WriteInteractiveReport(long sequence, bool success, string detail)
+		{
+			var report = new JsonObject
+			{
+				["schemaVersion"] = 1,
+				["sequence"] = sequence,
+				["status"] = success ? "success" : "failure",
+				["detail"] = detail,
+				["checks"] = new JsonArray(checks.Select(c => c.ToJson()).ToArray()),
+				["errors"] = new JsonArray(errors.Select(e => JsonValue.Create(e)).ToArray()),
+				["worldTick"] = world?.WorldTick ?? 0,
+			};
+			try
+			{
+				Directory.CreateDirectory(Path.GetDirectoryName(reportPath));
+				var temporary = reportPath + ".tmp";
+				File.WriteAllText(temporary, report.ToJsonString(JsonOptions));
+				File.Move(temporary, reportPath, true);
+			}
+			catch (Exception e)
+			{
+				Log.Write("debug", $"Failed to write WarpTest interactive gameplay report: {e}");
+			}
+		}
+
+		void CheckActorGroupInRegion(int index, JsonObject assertion)
+		{
+			var playerId = ReadString(assertion, "player");
+			var player = FindPlayer(playerId);
+			var radius = Math.Max(0, ReadInt(assertion, "radius", 3));
+			if (player == null || !TryParseCell(ReadString(assertion, "center"), out var center))
+			{
+				Fail($"assertions.{index}.actor_group_in_region", "Actor-region assertion has an invalid player or center.");
+				return;
+			}
+
+			var actorSpecs = assertion["actors"] as JsonArray ?? [];
+			var observed = new JsonObject();
+			var ok = true;
+			foreach (var actorNode in actorSpecs)
+			{
+				if (actorNode is not JsonObject actorSpec)
+					continue;
+
+				var actorType = ReadString(actorSpec, "actor");
+				var expected = Math.Max(1, ReadInt(actorSpec, "count", 1));
+				initialActorIds.TryGetValue((playerId.ToLowerInvariant(), actorType.ToLowerInvariant()), out var initial);
+				initial ??= [];
+				var actual = world.Actors.Count(a => a.IsInWorld && !a.IsDead && a.Owner == player
+					&& string.Equals(a.Info.Name, actorType, StringComparison.OrdinalIgnoreCase)
+					&& !initial.Contains(a.ActorID)
+					&& Math.Max(Math.Abs(a.Location.X - center.X), Math.Abs(a.Location.Y - center.Y)) <= radius);
+				observed[actorType] = actual;
+				ok &= actual >= expected;
+			}
+
+			AddCheck(
+				$"assertions.{index}.actor_group_in_region",
+				ok,
+				$"Registered combined-arms actors occupy the rally region around {center}.",
+				actorSpecs.DeepClone(),
+				observed);
 		}
 
 		void Finish(bool success, string detail)
@@ -1490,6 +1849,10 @@ namespace OpenRA.Mods.Common.Traits
 			public Actor Subject;
 			public ActorInfo ActorInfo;
 			public ProductionQueue Queue;
+			public CPos TargetCell;
+			public int Radius;
+			public readonly List<GroupBuildItem> GroupBuildItems = [];
+			public readonly List<Actor> GroupActors = [];
 
 			public ProbeAction(int index, JsonObject node)
 			{
@@ -1500,6 +1863,7 @@ namespace OpenRA.Mods.Common.Traits
 		}
 
 		sealed record BuildAttempt(string Player, string Actor, bool PrerequisiteRespected, bool QueueAccepted);
+		sealed record GroupBuildItem(string Actor, int Count, int BaselineCount);
 
 		sealed record ProbeCheck(string Name, string Status, string Detail, object Expected = null, object Actual = null)
 		{
