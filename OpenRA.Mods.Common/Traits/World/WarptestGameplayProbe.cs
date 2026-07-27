@@ -57,7 +57,9 @@ namespace OpenRA.Mods.Common.Traits
 		bool finished;
 		bool interactive;
 		bool interactiveReady;
+		bool interactiveRequestActive;
 		long interactiveSequence;
+		long interactiveRequestSequence;
 		bool fuzzReadyPending;
 		bool fuzzCandidateActive;
 		long fuzzSequence;
@@ -152,7 +154,21 @@ namespace OpenRA.Mods.Common.Traits
 						interactiveReady = true;
 						WriteInteractiveReport(0, true, "OpenRA interactive gameplay probe is ready.");
 					}
-					TryProcessInteractiveRequest();
+
+					if (!interactiveRequestActive)
+						TryStartInteractiveRequest();
+
+					if (!interactiveRequestActive)
+						return;
+
+					if (current == null && actionIndex < actions.Count)
+						StartAction(actions[actionIndex] as JsonObject);
+
+					if (current != null)
+						TickAction();
+
+					if (current == null && actionIndex >= actions.Count)
+						CompleteInteractiveRequest();
 					return;
 				}
 
@@ -1150,7 +1166,7 @@ namespace OpenRA.Mods.Common.Traits
 					&& string.Equals(a.Info.Name, required, StringComparison.OrdinalIgnoreCase)));
 		}
 
-		void TryProcessInteractiveRequest()
+		void TryStartInteractiveRequest()
 		{
 			if (!File.Exists(requestPath))
 				return;
@@ -1172,21 +1188,26 @@ namespace OpenRA.Mods.Common.Traits
 			interactiveSequence = sequence;
 			checks.Clear();
 			errors.Clear();
+			buildAttempts.Clear();
+			actions = request["actions"] as JsonArray ?? [];
 			assertions = request["assertions"] as JsonArray ?? [];
-			try
-			{
-				EvaluateAssertions();
-				var success = checks.All(c => c.Status == "success") && errors.Count == 0;
-				WriteInteractiveReport(
-					sequence,
-					success,
-					success ? "OpenRA live gameplay assertions passed." : "OpenRA live gameplay assertions failed.");
-			}
-			catch (Exception e)
-			{
-				Fail("interactive.exception", e.ToString());
-				WriteInteractiveReport(sequence, false, "OpenRA live gameplay assertion probe failed.");
-			}
+			actionIndex = 0;
+			current = null;
+			interactiveRequestSequence = sequence;
+			interactiveRequestActive = true;
+		}
+
+		void CompleteInteractiveRequest()
+		{
+			EvaluateAssertions();
+			var success = checks.All(c => c.Status == "success") && errors.Count == 0;
+			WriteInteractiveReport(
+				interactiveRequestSequence,
+				success,
+				success
+					? "OpenRA live gameplay actions and assertions passed."
+					: "OpenRA live gameplay actions or assertions failed.");
+			interactiveRequestActive = false;
 		}
 
 		void WriteInteractiveReport(long sequence, bool success, string detail)
@@ -1200,6 +1221,8 @@ namespace OpenRA.Mods.Common.Traits
 				["checks"] = new JsonArray(checks.Select(c => c.ToJson()).ToArray()),
 				["errors"] = new JsonArray(errors.Select(e => JsonValue.Create(e)).ToArray()),
 				["worldTick"] = world?.WorldTick ?? 0,
+				["actionsExecuted"] = Math.Min(actionIndex, actions?.Count ?? 0),
+				["actionsTotal"] = actions?.Count ?? 0,
 			};
 			try
 			{
