@@ -26,7 +26,7 @@ namespace OpenRA.Mods.Common.Traits
 	[Desc("Internal WarpTest harness: executes deterministic gameplay probe actions when configured by launch arguments.")]
 	public class WarptestGameplayProbeInfo : TraitInfo<WarptestGameplayProbe> { }
 
-	public sealed class WarptestGameplayProbe : IWorldLoaded, ITick
+	public sealed class WarptestGameplayProbe : IWorldLoaded, ITick, ITickRender
 	{
 		static readonly JsonSerializerOptions JsonOptions = new()
 		{
@@ -190,6 +190,20 @@ namespace OpenRA.Mods.Common.Traits
 				Fail("probe.exception", e.ToString());
 				Finish(false, "OpenRA gameplay probe failed with an exception.");
 			}
+		}
+
+		void ITickRender.TickRender(WorldRenderer wr, Actor self)
+		{
+			if (!active || finished || !interactive || interactiveRequestActive)
+				return;
+
+			// Campaign scripts and the in-game menu may pause simulation ticks while
+			// the rendered world remains available.  Formal GUI grading is read-only,
+			// so consume an empty-action request here instead of timing out on the last
+			// report sequence.  State-changing requests must still run through ITick.
+			TryStartInteractiveRequest();
+			if (interactiveRequestActive && actions.Count == 0)
+				CompleteInteractiveRequest();
 		}
 
 		void InitializeFuzzSessionWorld(World w)
